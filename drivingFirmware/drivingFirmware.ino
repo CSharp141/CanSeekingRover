@@ -11,11 +11,28 @@ WebServer server(80);
 
 // —— Pins & Pulse Ranges ——  
 const int ESC_PIN     = 18;   // ESC throttle signal  
-const int STEER_PIN   = 19;   // Steering servo signal  
+const int STEER_PIN   = 19;   // Steering servo signal
+const int TRIG_PIN    = 26;
+const int ECHO_PIN    = 27;  
+const int STEPPER_PIN = 33;
 const int escMin_us   = 1000; // full reverse
 const int escMax_us   = 2000; // full forward
 const int steerMin_us = 1300; // full left
 const int steerMax_us = 2000; // full right
+
+//define sound speed in cm/uS
+#define SOUND_SPEED 0.034
+
+// For the Ultrasonic sensor (US)
+Servo myServo;
+
+long SpinDuration;
+float distanceCm;
+
+struct shortestDist{
+  float distance;
+  int angle;
+};
 
 // —— Autonomous State Machine ——  
 enum class Mode : uint8_t {
@@ -100,6 +117,14 @@ void controlTask(void*) {
         break;
 
       case Mode::Seek:
+        shortestDist result = ultrasonicSpin();
+
+        Serial.printf("Shortest Distance: %.2f cm at angle %d\n", result.distance, result.angle);
+        // For the distance and angle ^^
+
+        int angleFromCamera = 0; //Input from the camera
+        float confirmedDistnace = confirmAngleDistance(angleFromCamera); // returns the confirmed distance
+
         if (Serial.available()) {
           int val = Serial.parseInt();
           if (val >= 0 && val <= 100) {
@@ -108,6 +133,9 @@ void controlTask(void*) {
         }
         throttlePct = 55;  // slow forward
         path.emplace_back(steerPct, throttlePct);
+
+
+
         break;
 
       case Mode::Pickup:
@@ -219,6 +247,80 @@ void handleMode() {
   server.send(200, "text/plain", "OK");
 }
 
+float confirmAngleDistance(int angle) {
+  myServo.write(angle);
+  delay(15);
+
+    // Clears the trigPin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  // Sets the trigPin on HIGH state for 10 micro seconds
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  SpinDuration = pulseIn(ECHO_PIN, HIGH);
+  
+  // Calculate the distance
+  distanceCm = SpinDuration * SOUND_SPEED/2;
+
+  Serial.print("Confirmed distance: ");
+  Serial.print(distanceCm);
+  Serial.print(" cm at angle ");
+  Serial.println(angle);
+
+  return distanceCm;
+
+}
+
+shortestDist ultrasonicSpin() {
+  
+  shortestDist shortestDistance = {9999.0, -1}; 
+
+  for (int pos = 0; pos <= 180; pos++) {
+    myServo.write(pos);
+    delay(15);
+    measureDistance(pos, shortestDistance);
+  }
+
+  for (int pos = 180; pos >= 0; pos--) {
+    myServo.write(pos);
+    delay(15);
+    measureDistance(pos, shortestDistance);
+  }
+
+    return shortestDistance;
+}
+
+void measureDistance(int angle, shortestDist &shortestDistance) {
+
+  // Clears the trigPin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  // Sets the trigPin on HIGH state for 10 micro seconds
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  SpinDuration = pulseIn(ECHO_PIN, HIGH);
+  
+  // Calculate the distance
+  distanceCm = SpinDuration * SOUND_SPEED/2;
+
+  Serial.print("Distance: ");
+  Serial.print(distanceCm);
+  Serial.print(" cm at angle ");
+  Serial.println(angle);
+
+  if (distanceCm < shortestDistance.distance) {
+    shortestDistance.distance = distanceCm;
+    shortestDistance.angle = angle;
+  }
+}  
+
+
 void setup() {
   // UART0 for seeker input (and optional debug)
   Serial.begin(115200);
@@ -245,9 +347,15 @@ void setup() {
   xTaskCreate(motorTask,   "motor",   2048, nullptr, 2, nullptr);
   xTaskCreate(steerTask,   "steer",   2048, nullptr, 2, nullptr);
   xTaskCreate(controlTask, "control", 4096, nullptr, 3, nullptr);
+
+  myServo.setPeriodHertz(50);          // SG90 needs 50 Hz
+  myServo.attach(STEPPER_PIN, 500, 2400);       // Pin 33, min/max pulse width in µs
+
+  pinMode(TRIG_PIN, OUTPUT); // Sets the trigPin as an Output
+  pinMode(ECHO_PIN, INPUT); // Sets the echoPin as an Input
+
 }
 
 void loop() {
   server.handleClient();
 }
-
