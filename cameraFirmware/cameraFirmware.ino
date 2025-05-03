@@ -7,9 +7,6 @@
  *    /         → last JPEG snapshot with center‐point overlay & stats
  *    /status   → JSON {angle,steering,detected,cx,cy}
  *    /snapshot → the JPEG frame used for last classification
- * 
- * Wi-Fi SSID: MyESP32AP
- * Password:   bigsweatyballs
  */
 
 #include <WiFi.h>
