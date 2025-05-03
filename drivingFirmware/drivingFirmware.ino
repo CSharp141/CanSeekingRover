@@ -140,15 +140,15 @@ void controlTask(void*) {
         throttlePct = 50;
         steerPct    = 50;
         //lower crane fully
-        step_motor(512, -1, true);}
+        step_motor(512, -1, true);
 
         //sweep crane 
-        for (i=0;i<2;++i){ 
+        for (int i=0;i<2;++i){ 
           step_motor(512, -1, false);}
-        for (i=0;i<4;++i){ 
+        for (int i=0;i<4;++i){ 
           step_motor(512, 1, false);}
-          
-        break;
+
+        break; 
 
       case Mode::Return:
         if (replayIndex < path.size()) {
