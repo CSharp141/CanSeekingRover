@@ -1,3 +1,5 @@
+#include <freertos/FreeRTOS.h>
+#include <freertos/timers.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
@@ -25,6 +27,10 @@ const int steerMax_us  = 2000;
 //define sound speed in cm/uS
 #define SOUND_SPEED 0.034
 
+// cap ultrasonic range to 300 cm → ~17.65 ms round-trip timeout
+#define MAX_DIST_CM         300.0f
+#define MAX_ECHO_TIMEOUT_US ((unsigned long)(2 * MAX_DIST_CM / SOUND_SPEED))
+
 // For the Ultrasonic sensor (US)
 Servo usServo;
 
@@ -37,7 +43,7 @@ struct shortestDist{
 };
 
 // —— FSM Modes ——  
-enum class Mode : uint8_t { Neutral, Forward, Seek, Pickup, Return };
+enum class Mode : uint8_t { Neutral, Forward, Seek, Pickup, Retrieve, Return };
 volatile Mode currentMode = Mode::Neutral;
 
 // Shared actuator commands (0–100 %)  
@@ -55,6 +61,8 @@ static bool forwardActive              = false;
 
 // Seek-mode timing & recovery  
 static constexpr unsigned long SEEK_THROTTLE_DURATION_MS = 1000;
+static constexpr TickType_t SEEK_BURST_TICKS = pdMS_TO_TICKS(1000);
+static TimerHandle_t burstTimer = nullptr;
 static constexpr unsigned long SEEK_RECOVERY_MS          = 500;
 static bool  seekThrottleActive       = false;
 static unsigned long seekThrottleStart = 0;
@@ -109,6 +117,12 @@ const int step_sequence[8][4] = {
 inline int pctToPulse(int pct, int mn, int mx) {
   pct = constrain(pct, 0, 100);
   return mn + (mx - mn) * pct / 100;
+}
+
+void onBurstTimeout(TimerHandle_t) {
+  throttlePct        = 50;          // full brake
+  seekThrottleActive = false;
+  lastBurstEnd       = millis();
 }
 
 // —— Motor & Steering Tasks (50 Hz) ——  
@@ -189,10 +203,9 @@ void controlTask(void*) {
             currentMode = Mode::Pickup;
             break;  // exit Seek immediately
           }
-    
+
           const float HOME = 90.0f;
-          const float HFOV = 62.0f;
-          // same conversion as camera code but using sd.angle
+          const float HFOV = 66.0f;
           int USpct = constrain(
             int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
             0, 100
@@ -215,42 +228,30 @@ void controlTask(void*) {
 
           lastSerialPct   = SerialPct;
           lastSerialAngle = SerialAng;
-          lastUsDist = USdist;
-          lastUsAng = USang;
-          lastUsPct = USpct;
+          lastUsDist      = USdist;
+          lastUsAng       = USang;
+          lastUsPct       = USpct;
 
           if (pct >= 0 && pct <= 100) {
             steerPct = pct;
             lastSteerPct = pct;
-            // only arm a new burst if recovery time has passed
+            // arm a new burst if recovery time has passed
             if (!seekThrottleActive &&
                 (millis() - lastBurstEnd >= SEEK_RECOVERY_MS)) {
               seekThrottleActive = true;
-              seekThrottleStart  = millis();
+              throttlePct        = 55;               // start burst immediately
+              xTimerStart(burstTimer, 0);            // schedule 1 s callback
             }
           }
         }
 
-
-        // 2) Drive throttle or brake
-        if (seekThrottleActive) {
-          if (millis() - seekThrottleStart < SEEK_THROTTLE_DURATION_MS) {
-            throttlePct = 55;
-          } else {
-            seekThrottleActive = false;
-            throttlePct        = 50;           // full stop/brake
-            lastBurstEnd       = millis();
-          }
-        } else {
-          throttlePct = 50;                   // hold full brake
-        }
-
-        // 3) Record only when moving
+        // 2) Record only when moving
         if (throttlePct > 50) {
           path.emplace_back(steerPct, throttlePct);
         }
         break;
       }
+
 
       case Mode::Pickup:
         throttlePct = 50;
@@ -267,6 +268,14 @@ void controlTask(void*) {
         }
 
         break; 
+
+      case Mode::Retrieve:
+        throttlePct = 50;
+        steerPct = 50;
+
+        step_motor(512, 1, true);
+
+        break;
 
       case Mode::Return:
         if (replayIndex < path.size()) {
@@ -320,6 +329,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="setMode('neutral')">Stop</button>
     <button onclick="setMode('seek')">Can Seek</button>
     <button onclick="setMode('pickup')">Pickup</button>
+    <button onclick="setMode('retrieve')">Retrieve</button>
     <button onclick="setMode('return')">Return</button>
   </div>
   <div id="debug">
@@ -382,6 +392,7 @@ void handleMode() {
   else if (m == "neutral") currentMode = Mode::Neutral;
   else if (m == "seek")    currentMode = Mode::Seek;
   else if (m == "pickup")  currentMode = Mode::Pickup;
+  else if (m == "retrieve") currentMode = Mode::Retrieve;
   else if (m == "return") {
     currentMode        = Mode::Return;
     replayIndex        = 0;
@@ -403,7 +414,7 @@ float confirmAngleDistance(int angle) {
   digitalWrite(TRIG_PIN, LOW);
   
   // Reads the echoPin, returns the sound wave travel time in microseconds
-  SpinDuration = pulseIn(ECHO_PIN, HIGH);
+  SpinDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
   
   // Calculate the distance
   distanceCm = SpinDuration * SOUND_SPEED/2;
@@ -422,7 +433,7 @@ void measureDistance(int angle, shortestDist &shortestDistance) {
   digitalWrite(TRIG_PIN, LOW);
   
   // Reads the echoPin, returns the sound wave travel time in microseconds
-  SpinDuration = pulseIn(ECHO_PIN, HIGH);
+  SpinDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
   
   // Calculate the distance
   distanceCm = SpinDuration * SOUND_SPEED/2;
@@ -437,7 +448,7 @@ shortestDist ultrasonicSpin() {
   
   shortestDist shortestDistance = {9999.0, -1}; 
 
-  for (int pos = 59; pos <= 121; pos++) {
+  for (int pos = 57; pos <= 123; pos++) {
     usServo.write(pos);
     delay(15);
     measureDistance(pos, shortestDistance);
@@ -509,6 +520,14 @@ void setup(){
   for (int i=0; i<5; ++i){ //change for height
     step_motor(512, -1, true);
   }
+
+  burstTimer = xTimerCreate(
+    "BurstTimer",
+    SEEK_BURST_TICKS,
+    pdFALSE,      // one‐shot
+    nullptr,
+    onBurstTimeout
+  );
 
   server.on("/",        handleRoot);
   server.on("/seekraw", handleSeekRaw);
