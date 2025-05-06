@@ -256,17 +256,9 @@ void controlTask(void*) {
       case Mode::Pickup:
         throttlePct = 50;
         steerPct    = 50;
-        //lower crane fully
-        step_motor(512, -1, true);
-
-        //sweep crane 
-        for (int i=0;i<2;++i){ 
-          step_motor(512, -1, false);
-        }
-        for (int i=0;i<4;++i){ 
-          step_motor(512, 1, false);
-        }
-
+        for (int i=0;i<2;++i){step_motor(512, -1, false);}
+        for (int i=0;i<4;++i){step_motor(512, 1, false);}
+        for (int i=0;i<2;++i){step_motor(512, -1, false);} 
         break; 
 
       case Mode::Retrieve:
@@ -517,7 +509,7 @@ void setup(){
   pinMode(XIN4, OUTPUT);
 
   //sets for can height
-  for (int i=0; i<5; ++i){ //change for height
+  for (int i=0; i<6; ++i){ //change for height
     step_motor(512, -1, true);
   }
 
