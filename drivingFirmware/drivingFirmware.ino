@@ -23,6 +23,10 @@ const int escMax_us    = 2000;
 const int steerMin_us  = 1300;
 const int steerMax_us  = 2000;
 
+const char* modeNames[] = {
+  "Neutral", "Forward", "Seek", "Pickup", "Retrieve", "Return"
+};
+
 
 //define sound speed in cm/uS
 #define SOUND_SPEED 0.034
@@ -34,7 +38,7 @@ const int steerMax_us  = 2000;
 // For the Ultrasonic sensor (US)
 Servo usServo;
 
-long SpinDuration;
+long PulseDuration;
 float distanceCm;
 
 struct shortestDist{
@@ -82,8 +86,8 @@ static bool extraReverseActive      = false;
 static unsigned long extraReverseStart = 0;
 
 // Reverse scaling constants  
-static constexpr float REVERSE_SCALE    = 1.75f;
-static constexpr int   REVERSE_HOLD_PCT = 25;
+static constexpr float REVERSE_SCALE    = 1.60f;
+static constexpr int   REVERSE_HOLD_PCT = 40;
 
 // Steering constants
 static constexpr int STEER_THRESH = 10;
@@ -199,17 +203,9 @@ void controlTask(void*) {
           float USdist = sd.distance;
           int USang  = sd.angle;
 
-          if (USdist > 0 && USdist < PICKUP_DISTANCE_CM) {
-            currentMode = Mode::Pickup;
-            break;  // exit Seek immediately
-          }
-
           const float HOME = 90.0f;
           const float HFOV = 66.0f;
-          int USpct = constrain(
-            int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
-            0, 100
-          );
+          int USpct = constrain(int(((USang - HOME)/HFOV + 0.5f) * 100.0f), 0, 100);
 
           int pct;
           int diff = abs(SerialPct - USpct);
@@ -231,6 +227,17 @@ void controlTask(void*) {
           lastUsDist      = USdist;
           lastUsAng       = USang;
           lastUsPct       = USpct;
+
+          const int US_MIN_ANGLE = 57;
+          const int US_MAX_ANGLE = 123;
+          int usServoPos = US_MIN_ANGLE + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
+          
+          float measuredDist = confirmAngleDistance(usServoPos);
+
+          if (USdist > 0 && USdist < PICKUP_DISTANCE_CM){
+            currentMode = Mode::Pickup;
+            break;  // exit Seek immediately
+          }
 
           if (pct >= 0 && pct <= 100) {
             steerPct = pct;
@@ -256,9 +263,17 @@ void controlTask(void*) {
       case Mode::Pickup:
         throttlePct = 50;
         steerPct    = 50;
-        for (int i=0;i<2;++i){step_motor(512, -1, false);}
-        for (int i=0;i<4;++i){step_motor(512, 1, false);}
-        for (int i=0;i<2;++i){step_motor(512, -1, false);} 
+        //lower crane fully
+        step_motor(512, -1, true);
+
+        //sweep crane 
+        for (int i=0;i<2;++i){ 
+          step_motor(512, -1, false);
+        }
+        for (int i=0;i<4;++i){ 
+          step_motor(512, 1, false);
+        }
+
         break; 
 
       case Mode::Retrieve:
@@ -272,8 +287,8 @@ void controlTask(void*) {
       case Mode::Return:
         if (replayIndex < path.size()) {
           auto &p = path[path.size() - 1 - replayIndex++];
-          steerPct = p.first;
-          int delta = p.second - 50;
+          steerPct = 100 - p.first;
+          int delta = 100 - p.second;
           int inv   = int(delta * REVERSE_SCALE + 0.5);
           throttlePct = constrain(50 - inv, 0, 100);
         } else {
@@ -303,15 +318,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-  body{margin:0;padding:1em;font-family:sans-serif;text-align:center;}
-  #controls{margin-top:2em;}
-  #controls input{width:4em;margin:0 .5em;}
-  #controls button{margin:.3em;padding:.6em 1em;font-size:1em;border:none;border-radius:4px;background:#4285F4;color:#fff;}
-  #debug{margin-top:1em;font-family:monospace;color:#333;}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body{margin:0;padding:1em;font-family:sans-serif;text-align:center;}
+    #controls{margin-top:2em;}
+    #controls input{width:4em;margin:0 .5em;}
+    #controls button{margin:.3em;padding:.6em 1em;font-size:1em;border:none;border-radius:4px;background:#4285F4;color:#fff;}
+    #debug{margin-top:1em;font-family:monospace;color:#333;}
+  </style>
 </head>
 <body>
   <h3>ESP32-Rover Autonomous Control</h3>
@@ -325,11 +340,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="setMode('return')">Return</button>
   </div>
   <div id="debug">
-    <div>UART %:      <span id="uartPct">–</span>%</div>
-    <div>UART angle:  <span id="uartAng">–</span>°</div>
-    <div>US %:        <span id="usPct">–</span>%</div>
-    <div>US angle:    <span id="usAng">–</span>°</div>
-    <div>US dist:     <span id="usDist">–</span>cm</div>
+    <div>UART %:        <span id="uartPct">–</span>%</div>
+    <div>UART angle:    <span id="uartAng">–</span>°</div>
+    <div>US %:          <span id="usPct">–</span>%</div>
+    <div>US angle:      <span id="usAng">–</span>°</div>
+    <div>US dist:       <span id="usDist">–</span>cm</div>
+    <div>Steering %:    <span id="steerPct">–</span>%</div>
+    <div>Distance to can:<span id="canDistance">–</span>cm</div>
+    <div>Current mode:  <span id="curMode">–</span></div>
   </div>
   <script>
     function setMode(m) {
@@ -345,12 +363,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       fetch('/seekraw')
         .then(r => r.text())
         .then(t => {
-          const [uartPct, uartAng, usPct, usAng, usDist] = t.split(',');
-          document.getElementById('uartPct').textContent = uartPct;
-          document.getElementById('uartAng').textContent = uartAng;
-          document.getElementById('usPct').textContent   = usPct;
-          document.getElementById('usAng').textContent   = usAng;
-          document.getElementById('usDist').textContent  = usDist;
+          const [uartPct, uartAng, usPct, usAng, usDist, steerPct, measuredDist, curMode] = t.split(',');
+          document.getElementById('uartPct').textContent   = uartPct;
+          document.getElementById('uartAng').textContent   = uartAng;
+          document.getElementById('usPct').textContent     = usPct;
+          document.getElementById('usAng').textContent     = usAng;
+          document.getElementById('usDist').textContent    = usDist;
+          document.getElementById('steerPct').textContent  = steerPct;
+          document.getElementById('canDistance').textContent = measuredDist;
+          document.getElementById('curMode').textContent   = curMode;
         });
     }, 200);
   </script>
@@ -358,17 +379,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleSeekRaw() {
-  // send SerialPct, SerialAng, USpct, USang, USdist
+  // send SerialPct, SerialAng, USpct, USang, USdist, lastSteerPct, currentMode
   String out = String(lastSerialPct) + "," 
              + String(lastSerialAngle) + "," 
              + String(lastUsPct) + "," 
              + String(lastUsAng) + "," 
-             + String(lastUsDist, 1);    // one decimal place
+             + String(lastUsDist, 1) + ","     // one decimal place
+             + String(lastSteerPct) + ","
+             + String(measuredDist, 1) + ","
+             + String(modeNames[static_cast<uint8_t>(currentMode)]);
   server.send(200, "text/plain", out);
 }
 
@@ -406,10 +431,10 @@ float confirmAngleDistance(int angle) {
   digitalWrite(TRIG_PIN, LOW);
   
   // Reads the echoPin, returns the sound wave travel time in microseconds
-  SpinDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
+  PulseDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
   
   // Calculate the distance
-  distanceCm = SpinDuration * SOUND_SPEED/2;
+  distanceCm = PulseDuration * SOUND_SPEED/2;
   return distanceCm;
 
 }
@@ -425,10 +450,10 @@ void measureDistance(int angle, shortestDist &shortestDistance) {
   digitalWrite(TRIG_PIN, LOW);
   
   // Reads the echoPin, returns the sound wave travel time in microseconds
-  SpinDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
+  PulseDuration = pulseIn(ECHO_PIN, HIGH, MAX_ECHO_TIMEOUT_US);
   
   // Calculate the distance
-  distanceCm = SpinDuration * SOUND_SPEED/2;
+  distanceCm = PulseDuration * SOUND_SPEED/2;
 
   if (distanceCm < shortestDistance.distance) {
     shortestDistance.distance = distanceCm;
@@ -509,7 +534,7 @@ void setup(){
   pinMode(XIN4, OUTPUT);
 
   //sets for can height
-  for (int i=0; i<6; ++i){ //change for height
+  for (int i=0; i<5; ++i){ //change for height
     step_motor(512, -1, true);
   }
 
