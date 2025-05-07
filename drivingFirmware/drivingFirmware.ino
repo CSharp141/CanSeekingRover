@@ -73,6 +73,7 @@ static unsigned long seekThrottleStart = 0;
 static unsigned long lastBurstEnd      = 0;
 static constexpr float PICKUP_DISTANCE_CM = 10.0f;
 volatile float measuredDist = -1.0f;
+static constexpr unsigned long ULTRA_ONLY_MS = 2000UL;  // if no UART in this window, go ultrasonic-only
 
 
 // Debug: last values parsed from UART0 and Ultrasonic sentor
@@ -87,7 +88,7 @@ static bool extraReverseActive      = false;
 static unsigned long extraReverseStart = 0;
 
 // Reverse scaling constants  
-static constexpr float REVERSE_SCALE    = 1.60f;
+static constexpr float REVERSE_SCALE    = 1.5f;
 static constexpr int   REVERSE_HOLD_PCT = 40;
 
 // Steering constants
@@ -105,6 +106,7 @@ const int XIN2 = 14;
 const int XIN3 = 32;
 const int XIN4 = 33;
 
+volatile int haveLowered = 0;
 const int STEP_DELAY_MS = 1; //step delay for motors
 static constexpr int HSTEP_DELAY_MS   = 5;
 
@@ -171,6 +173,7 @@ void controlTask(void*) {
         lastSerialPct   = -1;
         lastSerialAngle = -1;
         lastBurstEnd  = millis();
+        lastSerialTime     = millis();
       }
       lastMode = currentMode;
     }
@@ -199,69 +202,97 @@ void controlTask(void*) {
         break;
 
       case Mode::Seek: {
-        // 1) Read & update steerPct
+        unsigned long now = millis();
+        int pct = lastSteerPct;  // default steer if no new data
+
+        // 1) UART-driven branch: always do one US sweep here
         if (Serial.available()) {
           String pctStr = Serial.readStringUntil(',');
           String angStr = Serial.readStringUntil('\n');
           int SerialPct = pctStr.toInt();
           int SerialAng = angStr.toInt();
-          
+
+          // ultrasonic sweep for pickup-check & blending
           shortestDist sd = ultrasonicSpin();
-          float USdist = sd.distance;
-          int USang  = sd.angle;
+          float USdist    = sd.distance;
+          int   USang     = sd.angle;
 
           const float HOME = 90.0f;
           const float HFOV = 66.0f;
-          int USpct = constrain(int(((USang - HOME)/HFOV + 0.5f) * 100.0f), 0, 100);
+          int USpct = constrain(
+            int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
+            0, 100
+          );
 
-          int pct;
           int diff = abs(SerialPct - USpct);
-
           if (diff > STEER_THRESH) {
-            int dSerial = abs(SerialPct - lastSteerPct);
-            int dUS     = abs(USpct     - lastSteerPct);
-            pct = (dSerial <= dUS) ? SerialPct : USpct;
-          }
-          else if (diff < STEER_THRESH) {
+            int dS = abs(SerialPct - lastSteerPct);
+            int dU = abs(USpct     - lastSteerPct);
+            pct = (dS <= dU) ? SerialPct : USpct;
+          } else {
             pct = (SerialPct + USpct) / 2;
           }
-          else {
-            pct = lastSteerPct;
-          }
 
-          lastSerialPct   = SerialPct;
-          lastSerialAngle = SerialAng;
-          lastUsDist      = USdist;
-          lastUsAng       = USang;
-          lastUsPct       = USpct;
+          // reset timeout & save debug values
+          lastSerialTime   = now;
+          lastSerialPct    = SerialPct;
+          lastSerialAngle  = SerialAng;
+          lastUsDist       = USdist;
+          lastUsAng        = USang;
+          lastUsPct        = USpct;
+        }
+        // 2) Timeout-driven branch: no UART recently → do one pure-US sweep
+        else if (now - lastSerialTime > ULTRA_ONLY_MS) {
+          shortestDist sd = ultrasonicSpin();
+          float USdist    = sd.distance;
+          int   USang     = sd.angle;
 
+          const float HOME = 90.0f;
+          const float HFOV = 66.0f;
+          pct = constrain(
+            int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
+            0, 100
+          );
+
+          // reset timeout & save debug
+          lastSerialTime = now;
+          lastUsDist     = USdist;
+          lastUsAng      = USang;
+          lastUsPct      = pct;
+        }
+
+        // 3) Compute servo angle & check for pickup
+        {
           const int US_MIN_ANGLE = 57;
           const int US_MAX_ANGLE = 123;
-          int steeringAng = US_MIN_ANGLE + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
+          int steeringAng = US_MIN_ANGLE
+                         + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
           float measuredDistance = confirmAngleDistance(steeringAng);
 
-          if (measuredDistance > 0 && measuredDistance < PICKUP_DISTANCE_CM){
+          if (measuredDistance > 0 && measuredDistance < PICKUP_DISTANCE_CM) {
             currentMode = Mode::Pickup;
             break;  // exit Seek immediately
           }
+        }
 
-          if (pct >= 0 && pct <= 100) {
-            steerPct = pct;
-            lastSteerPct = pct;
-            // arm a new burst if recovery time has passed
-            if (!seekThrottleActive &&
-                (millis() - lastBurstEnd >= SEEK_RECOVERY_MS)) {
-              seekThrottleActive = true;
-              throttlePct        = 55;               // start burst immediately
-              xTimerStart(burstTimer, 0);            // schedule 1 s callback
-            }
+        // 4) Apply steering + throttle-burst logic
+        if (pct >= 0 && pct <= 100) {
+          steerPct     = pct;
+          lastSteerPct = pct;
+
+          if (!seekThrottleActive &&
+              (now - lastBurstEnd >= SEEK_RECOVERY_MS)) {
+            seekThrottleActive = true;
+            throttlePct        = 55;       // start burst immediately
+            xTimerStart(burstTimer, 0);
           }
         }
 
-        // 2) Record only when moving
+        // 5) Record path when moving forward
         if (throttlePct > 50) {
           path.emplace_back(steerPct, throttlePct);
         }
+
         break;
       }
 
@@ -270,8 +301,10 @@ void controlTask(void*) {
         throttlePct = 50;
         steerPct    = 50;
         //lower crane fully
-        step_motor(512, -1, true);
-
+        if (haveLowered == 0){
+          step_motor(2048, -1, true);
+          haveLowered = 1;
+        }
         //sweep crane 
         step_motor(QTR_SWEEP_STEPS,     -1, false);
         delay(SWEEP_PAUSE_MS);
@@ -292,15 +325,20 @@ void controlTask(void*) {
         if (replayIndex < path.size()) {
           auto &p = path[path.size() - 1 - replayIndex++];
           steerPct = 100 - p.first;
-          int delta = 100 - p.second;
-          int inv   = int(delta * REVERSE_SCALE + 0.5);
-          throttlePct = constrain(50 - inv, 0, 100);
+
+          // Invert + scale throttle around neutral (50%)
+          int  recordedThrottle    = p.second;                                // [0..100]
+          int  throttleMag         = recordedThrottle - 50;                   // how far above neutral
+          int  invThrottleMag      = int(throttleMag * REVERSE_SCALE + 0.5f); // apply scale
+          int  outThrottle         = 50 - invThrottleMag;                           // flip to reverse side
+          throttlePct              = constrain(outThrottle, 0, 100);
+
         } else {
           if (!extraReverseActive) {
             extraReverseActive = true;
             extraReverseStart  = millis();
           }
-          if (millis() - extraReverseStart < 5000) {
+          if (millis() - extraReverseStart < 2000) {
             steerPct    = 50;
             throttlePct = REVERSE_HOLD_PCT;
           } else {
@@ -539,11 +577,6 @@ void setup(){
   pinMode(XIN3, OUTPUT);
   pinMode(XIN4, OUTPUT);
 
-  //sets for can height
-  for (int i=0; i<5; ++i){ //change for height
-    step_motor(512, -1, true);
-  }
-
   burstTimer = xTimerCreate(
     "BurstTimer",
     SEEK_BURST_TICKS,
@@ -563,5 +596,8 @@ void setup(){
 }
 
 void loop(){
+  server.handleClient();
+}
+
   server.handleClient();
 }
