@@ -72,6 +72,7 @@ static bool  seekThrottleActive       = false;
 static unsigned long seekThrottleStart = 0;
 static unsigned long lastBurstEnd      = 0;
 static constexpr float PICKUP_DISTANCE_CM = 10.0f;
+volatile float measuredDist = -1.0f;
 
 
 // Debug: last values parsed from UART0 and Ultrasonic sentor
@@ -105,6 +106,12 @@ const int XIN3 = 32;
 const int XIN4 = 33;
 
 const int STEP_DELAY_MS = 1; //step delay for motors
+static constexpr int HSTEP_DELAY_MS   = 5;
+
+// how many half-steps = 90° (¼ of 4096)
+static constexpr int QTR_SWEEP_STEPS = 1024;
+// pause between sweeps
+static constexpr int SWEEP_PAUSE_MS   = 500;
 
 // Half-step sequence (8 steps)
 const int step_sequence[8][4] = {
@@ -230,11 +237,10 @@ void controlTask(void*) {
 
           const int US_MIN_ANGLE = 57;
           const int US_MAX_ANGLE = 123;
-          int usServoPos = US_MIN_ANGLE + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
-          
-          float measuredDist = confirmAngleDistance(usServoPos);
+          int steeringAng = US_MIN_ANGLE + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
+          float measuredDistance = confirmAngleDistance(steeringAng);
 
-          if (USdist > 0 && USdist < PICKUP_DISTANCE_CM){
+          if (measuredDistance > 0 && measuredDistance < PICKUP_DISTANCE_CM){
             currentMode = Mode::Pickup;
             break;  // exit Seek immediately
           }
@@ -267,13 +273,11 @@ void controlTask(void*) {
         step_motor(512, -1, true);
 
         //sweep crane 
-        for (int i=0;i<2;++i){ 
-          step_motor(512, -1, false);
-        }
-        for (int i=0;i<4;++i){ 
-          step_motor(512, 1, false);
-        }
-
+        step_motor(QTR_SWEEP_STEPS,     -1, false);
+        delay(SWEEP_PAUSE_MS);
+        step_motor(2*QTR_SWEEP_STEPS,    1, false);
+        delay(SWEEP_PAUSE_MS);
+        step_motor(QTR_SWEEP_STEPS,     -1, false);
         break; 
 
       case Mode::Retrieve:
@@ -392,7 +396,7 @@ void handleSeekRaw() {
              + String(lastUsAng) + "," 
              + String(lastUsDist, 1) + ","     // one decimal place
              + String(lastSteerPct) + ","
-             + String(measuredDist, 1) + ","
+             + String(distanceCm, 1) + ","
              + String(modeNames[static_cast<uint8_t>(currentMode)]);
   server.send(200, "text/plain", out);
 }
@@ -495,10 +499,12 @@ void set_step(const int step[4], bool motor) {
   }
 }
 void step_motor(int steps, int direction, bool motor) {
+  // choose fast vs. slow delay
+  int dly = motor ? STEP_DELAY_MS : HSTEP_DELAY_MS;
   for (int i = 0; i < steps; i++) {
     int idx = (direction > 0) ? (i % 8) : (7 - (i % 8));
     set_step(step_sequence[idx], motor);
-    delay(STEP_DELAY_MS);
+    delay(dly);
   }
 }
 
