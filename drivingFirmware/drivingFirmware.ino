@@ -55,8 +55,17 @@ volatile int throttlePct = 50;  // 50 = neutral/brake
 volatile int steerPct    = 50;  // 50 = straight
 
 // Path memory for Return mode  
-static std::vector<std::pair<uint8_t,uint8_t>> path;
-static size_t replayIndex = 0;
+static constexpr int FORWARD_REVERSE_PCT = 35;  // 40%
+static constexpr int SEEK_REVERSE_PCT    = 40;
+
+enum class EventType : uint8_t { Forward, SeekPulse };
+
+struct PathEvent {
+  uint8_t    steerPct;  // steering % at burst start
+  EventType  type;      // Forward vs. SeekPulse
+};
+
+static std::vector<PathEvent> pathEvents;
 
 // Forward-mode timing  
 static unsigned long forwardDurationMs = 0;
@@ -72,9 +81,9 @@ static bool  seekThrottleActive       = false;
 static unsigned long seekThrottleStart = 0;
 static unsigned long lastBurstEnd      = 0;
 static constexpr float PICKUP_DISTANCE_CM = 10.0f;
-volatile float measuredDist = -1.0f;
 static constexpr unsigned long ULTRA_ONLY_MS = 2000UL;  // if no UART in this window, go ultrasonic-only
-
+static unsigned long lastSerialTime = 0;
+volatile float measuredDistance = 1.0f;
 
 // Debug: last values parsed from UART0 and Ultrasonic sentor
 volatile int lastSerialPct     = -1;
@@ -88,7 +97,7 @@ static bool extraReverseActive      = false;
 static unsigned long extraReverseStart = 0;
 
 // Reverse scaling constants  
-static constexpr float REVERSE_SCALE    = 1.5f;
+static constexpr float REVERSE_SCALE    = 1.6f;
 static constexpr int   REVERSE_HOLD_PCT = 40;
 
 // Steering constants
@@ -189,6 +198,8 @@ void controlTask(void*) {
         if (!forwardActive) {
           forwardStartTime = millis();
           forwardActive    = true;
+          forwardStartTime = millis();
+          forwardActive    = true;
         }
         if (millis() - forwardStartTime >= forwardDurationMs) {
           currentMode       = Mode::Neutral;
@@ -198,111 +209,102 @@ void controlTask(void*) {
         }
         steerPct    = 50;
         throttlePct = 60;
-        path.emplace_back(steerPct, throttlePct);
+
         break;
 
       case Mode::Seek: {
-        unsigned long now = millis();
-        int pct = lastSteerPct;  // default steer if no new data
+        static constexpr unsigned long UART_WAIT_MS    = 2000;  // how long to wait for CV data
+        unsigned long now       = millis();
+        unsigned long waitStart = now;
+        bool gotSerial          = false;
+        int  serialPct = 0, serialAng = 0;
 
-        // 1) UART-driven branch: always do one US sweep here
-        if (Serial.available()) {
-          String pctStr = Serial.readStringUntil(',');
-          String angStr = Serial.readStringUntil('\n');
-          int SerialPct = pctStr.toInt();
-          int SerialAng = angStr.toInt();
+        // 1) Wait up to UART_WAIT_MS for a new packet
+        while (millis() - waitStart < UART_WAIT_MS) {
+          if (Serial.available()) {
+            // read exactly one “pct,ang\n” pair
+            String pctStr = Serial.readStringUntil(',');
+            String angStr = Serial.readStringUntil('\n');
+            serialPct     = pctStr.toInt();
+            serialAng     = angStr.toInt();
+            gotSerial     = true;
+            lastSerialTime = millis();
+            break;
+          }
+          // give other tasks a chance
+          vTaskDelay(pdMS_TO_TICKS(5));
+        }
 
-          // ultrasonic sweep for pickup-check & blending
-          shortestDist sd = ultrasonicSpin();
-          float USdist    = sd.distance;
-          int   USang     = sd.angle;
+        // 2) Always do one ultrasonic sweep next
+        shortestDist sd = ultrasonicSpin();
+        float USdist = sd.distance;
+        int   USang  = sd.angle;
 
-          const float HOME = 90.0f;
-          const float HFOV = 66.0f;
-          int USpct = constrain(
-            int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
-            0, 100
-          );
+        // map US angle → [0..100]%
+        const float HOME = 90.0f, HFOV = 66.0f;
+        int USpct = constrain(int(((USang - HOME)/HFOV + 0.5f)*100.0f), 0, 100);
 
-          int diff = abs(SerialPct - USpct);
+        // save debug
+        lastUsDist = USdist;
+        lastUsAng  = USang;
+        lastUsPct  = USpct;
+
+        // 3) Blend or fallback
+        int pct;
+        if (gotSerial) {
+          int diff = abs(serialPct - USpct);
           if (diff > STEER_THRESH) {
-            int dS = abs(SerialPct - lastSteerPct);
+            // whichever is closer to lastSteerPct
+            int dS = abs(serialPct - lastSteerPct);
             int dU = abs(USpct     - lastSteerPct);
-            pct = (dS <= dU) ? SerialPct : USpct;
+            pct = (dS <= dU) ? serialPct : USpct;
           } else {
-            pct = (SerialPct + USpct) / 2;
+            pct = (serialPct + USpct)/2;
           }
-
-          // reset timeout & save debug values
-          lastSerialTime   = now;
-          lastSerialPct    = SerialPct;
-          lastSerialAngle  = SerialAng;
-          lastUsDist       = USdist;
-          lastUsAng        = USang;
-          lastUsPct        = USpct;
+          // save for debugging
+          lastSerialPct   = serialPct;
+          lastSerialAngle = serialAng;
+        } else {
+            // camera too slow → pure‐US fallback
+            int delta = abs(USpct - lastSteerPct);
+            if (delta <= STEER_THRESH) {
+                // only accept small jumps
+                pct = USpct;
+            } else {
+                // ignore big jumps, hold previous direction
+                pct = lastSteerPct;
+                break;
+            }
         }
-        // 2) Timeout-driven branch: no UART recently → do one pure-US sweep
-        else if (now - lastSerialTime > ULTRA_ONLY_MS) {
-          shortestDist sd = ultrasonicSpin();
-          float USdist    = sd.distance;
-          int   USang     = sd.angle;
+        // 4) pickup check at this new angle
+        const int US_MIN_ANGLE = 59, US_MAX_ANGLE = 121;
+        int steeringAng = US_MIN_ANGLE + (US_MAX_ANGLE - US_MIN_ANGLE)*pct/100;
+        measuredDistance = confirmAngleDistance(steeringAng);
 
-          const float HOME = 90.0f;
-          const float HFOV = 66.0f;
-          pct = constrain(
-            int(((USang - HOME)/HFOV + 0.5f) * 100.0f),
-            0, 100
-          );
-
-          // reset timeout & save debug
-          lastSerialTime = now;
-          lastUsDist     = USdist;
-          lastUsAng      = USang;
-          lastUsPct      = pct;
+        if (measuredDistance > 0 && measuredDistance < PICKUP_DISTANCE_CM) {
+          currentMode = Mode::Pickup;
+          break;
         }
 
-        // 3) Compute servo angle & check for pickup
-        {
-          const int US_MIN_ANGLE = 57;
-          const int US_MAX_ANGLE = 123;
-          int steeringAng = US_MIN_ANGLE
-                         + (US_MAX_ANGLE - US_MIN_ANGLE) * pct / 100;
-          float measuredDistance = confirmAngleDistance(steeringAng);
-
-          if (measuredDistance > 0 && measuredDistance < PICKUP_DISTANCE_CM) {
-            currentMode = Mode::Pickup;
-            break;  // exit Seek immediately
-          }
-        }
-
-        // 4) Apply steering + throttle-burst logic
-        if (pct >= 0 && pct <= 100) {
-          steerPct     = pct;
-          lastSteerPct = pct;
-
-          if (!seekThrottleActive &&
-              (now - lastBurstEnd >= SEEK_RECOVERY_MS)) {
-            seekThrottleActive = true;
-            throttlePct        = 55;       // start burst immediately
-            xTimerStart(burstTimer, 0);
-          }
-        }
-
-        // 5) Record path when moving forward
-        if (throttlePct > 50) {
-          path.emplace_back(steerPct, throttlePct);
+        // 5) steering + throttle burst
+        steerPct     = pct;
+        lastSteerPct = pct;
+        if (!seekThrottleActive && (now - lastBurstEnd >= SEEK_RECOVERY_MS)) {
+          seekThrottleActive = true;
+          throttlePct        = 55;
+          xTimerStart(burstTimer, 0);
+          pathEvents.push_back({ lastSteerPct, EventType::SeekPulse });
         }
 
         break;
       }
-
 
       case Mode::Pickup:
         throttlePct = 50;
         steerPct    = 50;
         //lower crane fully
         if (haveLowered == 0){
-          step_motor(2048, -1, true);
+          step_motor(2304, -1, true);
           haveLowered = 1;
         }
         //sweep crane 
@@ -317,38 +319,52 @@ void controlTask(void*) {
         throttlePct = 50;
         steerPct = 50;
 
-        step_motor(512, 1, true);
+        step_motor(2304, 1, true);
+        currentMode = Mode::Neutral;
 
         break;
 
       case Mode::Return:
-        if (replayIndex < path.size()) {
-          auto &p = path[path.size() - 1 - replayIndex++];
-          steerPct = 100 - p.first;
+        if (!pathEvents.empty()) {
+          // 1) Replay every event in reverse order
+          for (int i = (int)pathEvents.size() - 1; i >= 0; --i) {
+            auto &e = pathEvents[i];
 
-          // Invert + scale throttle around neutral (50%)
-          int  recordedThrottle    = p.second;                                // [0..100]
-          int  throttleMag         = recordedThrottle - 50;                   // how far above neutral
-          int  invThrottleMag      = int(throttleMag * REVERSE_SCALE + 0.5f); // apply scale
-          int  outThrottle         = 50 - invThrottleMag;                           // flip to reverse side
-          throttlePct              = constrain(outThrottle, 0, 100);
+            // invert steering
+            steerPct = 100 - e.steerPct;
 
-        } else {
+            if (e.type == EventType::Forward) {
+              // reverse the single Forward run
+              throttlePct = FORWARD_REVERSE_PCT;               // e.g. 35%
+              vTaskDelay(pdMS_TO_TICKS(forwardDurationMs));
+            } else {
+              // reverse one Seek burst
+              throttlePct = SEEK_REVERSE_PCT;                  // e.g. 40%
+              vTaskDelay(pdMS_TO_TICKS(SEEK_THROTTLE_DURATION_MS));
+              throttlePct = 50;                                // coast/brake
+              vTaskDelay(pdMS_TO_TICKS(SEEK_RECOVERY_MS));
+            }
+          }
+
+          // 2) Clear so next cycle we fall into the extraReverseActive block
+          pathEvents.clear();
+        }
+        else {
+          // your existing “extraReverseActive” fallback
           if (!extraReverseActive) {
             extraReverseActive = true;
             extraReverseStart  = millis();
           }
-          if (millis() - extraReverseStart < 2000) {
+          if (millis() - extraReverseStart < 8000) {
             steerPct    = 50;
             throttlePct = REVERSE_HOLD_PCT;
           } else {
             extraReverseActive = false;
             currentMode        = Mode::Neutral;
-            path.clear();
-            replayIndex        = 0;
           }
         }
         break;
+
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -373,7 +389,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
   <h3>ESP32-Rover Autonomous Control</h3>
   <div id="controls">
-    <label>Forward for <input id="forwardTime" type="number" min="1" value="5"> s</label><br>
+    <label>Forward for <input id="forwardTime" type="number" min="0.1" step="0.1" value="5.0"> s</label><br>
     <button onclick="setMode('forward')">Go Forward</button>
     <button onclick="setMode('neutral')">Stop</button>
     <button onclick="setMode('seek')">Can Seek</button>
@@ -386,7 +402,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div>UART angle:    <span id="uartAng">–</span>°</div>
     <div>US %:          <span id="usPct">–</span>%</div>
     <div>US angle:      <span id="usAng">–</span>°</div>
-    <div>US dist:       <span id="usDist">–</span>cm</div>
     <div>Steering %:    <span id="steerPct">–</span>%</div>
     <div>Distance to can:<span id="canDistance">–</span>cm</div>
     <div>Current mode:  <span id="curMode">–</span></div>
@@ -405,14 +420,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       fetch('/seekraw')
         .then(r => r.text())
         .then(t => {
-          const [uartPct, uartAng, usPct, usAng, usDist, steerPct, measuredDist, curMode] = t.split(',');
+          const [uartPct, uartAng, usPct, usAng, steerPct, canDistance, curMode] = t.split(',');
           document.getElementById('uartPct').textContent   = uartPct;
           document.getElementById('uartAng').textContent   = uartAng;
           document.getElementById('usPct').textContent     = usPct;
           document.getElementById('usAng').textContent     = usAng;
-          document.getElementById('usDist').textContent    = usDist;
           document.getElementById('steerPct').textContent  = steerPct;
-          document.getElementById('canDistance').textContent = measuredDist;
+          document.getElementById('canDistance').textContent = canDistance;
           document.getElementById('curMode').textContent   = curMode;
         });
     }, 200);
@@ -427,14 +441,13 @@ void handleRoot() {
 }
 
 void handleSeekRaw() {
-  // send SerialPct, SerialAng, USpct, USang, USdist, lastSteerPct, currentMode
+  // send SerialPct, SerialAng, USpct, USang, lastSteerPct, distanceCm, currentMode
   String out = String(lastSerialPct) + "," 
              + String(lastSerialAngle) + "," 
              + String(lastUsPct) + "," 
-             + String(lastUsAng) + "," 
-             + String(lastUsDist, 1) + ","     // one decimal place
+             + String(lastUsAng) + ","
              + String(lastSteerPct) + ","
-             + String(distanceCm, 1) + ","
+             + String(measuredDistance, 1) + ","
              + String(modeNames[static_cast<uint8_t>(currentMode)]);
   server.send(200, "text/plain", out);
 }
@@ -444,7 +457,7 @@ void handleMode() {
   String m = server.arg("m");
   if (m == "forward") {
     if (server.hasArg("t"))
-      forwardDurationMs = server.arg("t").toInt() * 1000UL;
+      forwardDurationMs = (unsigned long)(server.arg("t").toFloat() * 1000.0f);
     forwardActive = false;
     currentMode   = Mode::Forward;
   }
@@ -454,7 +467,6 @@ void handleMode() {
   else if (m == "retrieve") currentMode = Mode::Retrieve;
   else if (m == "return") {
     currentMode        = Mode::Return;
-    replayIndex        = 0;
     extraReverseActive = false;
   }
   server.send(200, "text/plain", "OK");
@@ -507,7 +519,7 @@ shortestDist ultrasonicSpin() {
   
   shortestDist shortestDistance = {9999.0, -1}; 
 
-  for (int pos = 57; pos <= 123; pos++) {
+  for (int pos = 59; pos <= 121; pos++) {
     usServo.write(pos);
     delay(15);
     measureDistance(pos, shortestDistance);
@@ -598,6 +610,5 @@ void setup(){
 void loop(){
   server.handleClient();
 }
-
   server.handleClient();
 }
