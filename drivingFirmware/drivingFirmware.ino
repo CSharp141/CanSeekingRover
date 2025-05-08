@@ -80,7 +80,7 @@ static constexpr unsigned long SEEK_RECOVERY_MS          = 500;
 static bool  seekThrottleActive       = false;
 static unsigned long seekThrottleStart = 0;
 static unsigned long lastBurstEnd      = 0;
-static constexpr float PICKUP_DISTANCE_CM = 10.0f;
+static constexpr float PICKUP_DISTANCE_CM = 14.0f;
 static constexpr unsigned long ULTRA_ONLY_MS = 2000UL;  // if no UART in this window, go ultrasonic-only
 static unsigned long lastSerialTime = 0;
 volatile float measuredDistance = 1.0f;
@@ -304,7 +304,7 @@ void controlTask(void*) {
         steerPct    = 50;
         //lower crane fully
         if (haveLowered == 0){
-          step_motor(2304, -1, true);
+          step_motor(1028, -1, true);
           haveLowered = 1;
         }
         //sweep crane 
@@ -319,7 +319,7 @@ void controlTask(void*) {
         throttlePct = 50;
         steerPct = 50;
 
-        step_motor(2304, 1, true);
+        step_motor(1028, 1, true);
         currentMode = Mode::Neutral;
 
         break;
@@ -608,7 +608,5 @@ void setup(){
 }
 
 void loop(){
-  server.handleClient();
-}
   server.handleClient();
 }
