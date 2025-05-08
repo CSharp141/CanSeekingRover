@@ -1,12 +1,7 @@
 /* 
  * ESP32-CAM + Edge Impulse
- * • Single‐servo pan pointing
  * • 0–100% steering → Serial
  * • Flash LED on detection
- * • Web UI:
- *    /         → last JPEG snapshot with center‐point overlay & stats
- *    /status   → JSON {angle,steering,detected,cx,cy}
- *    /snapshot → the JPEG frame used for last classification
  */
 
 #include <WiFi.h>
@@ -20,15 +15,8 @@
 #define WIFI_SSID     "ESP32-Rover"
 #define WIFI_PASSWORD "roverpw123"
 
-// —— Servo config ————————————————————————————————————————
-#define SERVO_PIN        13
-#define SERVO_FREQ       50
-#define SERVO_MIN_PULSE  500
-#define SERVO_MAX_PULSE  2400
-#define SERVO_HOME_ANGLE 90
-
 // —— Detection threshold & flash LED ——————————————————————————
-#define MIN_CONFIDENCE   0.5f
+#define MIN_CONFIDENCE   0.70f
 #define FLASH_GPIO_NUM   4
 
 // —— Camera (AI-Thinker ESP32-CAM) pins —————————————————————————
@@ -87,17 +75,12 @@ static camera_config_t camera_config = {
   .grab_mode      = CAMERA_GRAB_WHEN_EMPTY,
 };
 
-WebServer server(80);
-Servo panServo;
-
 // PSRAM buffers
 uint8_t *snapshot_buf      = nullptr; // RGB888 input for Edge Impulse
 uint8_t *jpeg_snapshot_buf = nullptr; // raw JPEG for serving
 size_t  jpeg_snapshot_len  = 0;
 
 // Live state
-volatile int currentAngle    = SERVO_HOME_ANGLE;
-volatile int currentSteering = 0;
 volatile bool last_detected  = false;
 volatile float last_cx       = 0.0f;
 volatile float last_cy       = 0.0f;
@@ -150,112 +133,6 @@ bool captureAndConvert() {
   return true;
 }
 
-//—— HTTP: root page (always show snapshot, single red dot when detected) —————————
-void handleRoot() {
-  const char* html = R"rawliteral(
-<html><head><meta charset="utf-8"><title>ESP32 Steering</title>
-<style>
-  body {
-    margin: 0;
-    background: #111;
-    color: #eee;
-    font-family: sans-serif;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-  }
-  #container {
-    position: relative;
-    width: 320px;
-    height: 240px;
-    margin-top: 20px;
-    border: 2px solid #444;
-  }
-  #snap {
-    width: 100%;
-    height: 100%;
-    display: block;
-  }
-  #overlay {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-  }
-  #stats {
-    margin-top: 10px;
-    font-size: 16px;
-  }
-</style>
-</head><body>
-  <h1>ESP32 Steering Status</h1>
-  <div id="container">
-    <img id="snap" src="/snapshot" />
-    <canvas id="overlay" width="320" height="240"></canvas>
-  </div>
-  <div id="stats">
-    Angle: <span id="angle">--</span>&deg;
-    &nbsp; Steering: <span id="steer">--</span>%
-  </div>
-<script>
-  const img    = document.getElementById('snap'),
-        canvas = document.getElementById('overlay'),
-        ctx    = canvas.getContext('2d');
-  async function upd() {
-    // always reload the latest snapshot (cache‐buster)
-    img.src = '/snapshot?ts=' + Date.now();
-    // fetch status
-    let res = await fetch('/status'),
-        j   = await res.json();
-    document.getElementById('angle').textContent = j.angle;
-    document.getElementById('steer').textContent = j.steering;
-    // clear previous dot
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    // draw one dot if detection
-    if (j.detected) {
-      ctx.fillStyle = 'red';
-      ctx.beginPath();
-      ctx.arc(j.cx, j.cy, 5, 0, 2 * Math.PI);
-      ctx.fill();
-    }
-  }
-  // poll every 500 ms
-  setInterval(upd, 500);
-  upd();
-</script>
-</body></html>
-)rawliteral";
-
-  server.send(200, "text/html; charset=utf-8", html);
-}
-
-
-//—— HTTP: serve last JPEG snapshot —————————————————————————
-void handleSnapshot() {
-  if (!jpeg_snapshot_len) {
-    server.send(404);
-    return;
-  }
-  server.sendHeader("Content-Type","image/jpeg");
-  server.sendHeader("Content-Length",String(jpeg_snapshot_len));
-  server.send(200);
-  server.client().write(jpeg_snapshot_buf, jpeg_snapshot_len);
-}
-
-//—— HTTP: JSON status (single centroid) —————————————————————
-void handleStatus() {
-  String js = "{\"angle\":" + String(currentAngle)
-            + ",\"steering\":" + String(currentSteering)
-            + ",\"detected\":" + (last_detected?"true":"false");
-  if (last_detected) {
-    js += ",\"cx\":" + String(last_cx,1)
-       +  ",\"cy\":" + String(last_cy,1);
-  }
-  js += "}";
-  server.send(200, "application/json", js);
-}
-
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
@@ -266,7 +143,6 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print('.'); delay(500);
   }
-  Serial.println("\nIP = " + WiFi.localIP().toString());
 
   // Flash LED
   pinMode(FLASH_GPIO_NUM, OUTPUT);
@@ -286,22 +162,9 @@ void setup() {
   if (!snapshot_buf || !jpeg_snapshot_buf) {
     Serial.println("PSRAM alloc failed"); while (1) delay(1000);
   }
-
-  // Servo
-  panServo.setPeriodHertz(SERVO_FREQ);
-  panServo.attach(SERVO_PIN, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
-  panServo.write(SERVO_HOME_ANGLE);
-
-  // Web routes
-  server.on("/",         HTTP_GET, handleRoot);
-  server.on("/snapshot", HTTP_GET, handleSnapshot);
-  server.on("/status",   HTTP_GET, handleStatus);
-  server.begin();
 }
 
 void loop() {
-  server.handleClient();
-
   if (ei_sleep(5) != EI_IMPULSE_OK) return;
   if (!captureAndConvert()) return;
 
@@ -332,17 +195,14 @@ void loop() {
 
     // normalized steering
     int pct = constrain(int((last_cx / float(EI_CLASSIFIER_INPUT_WIDTH)) * 100), 0, 100);
-    currentSteering = pct;
-    Serial.println(pct);
 
-    // servo angle
+    // angle
     const float HFOV = 62.0f;
     float err = last_cx - (EI_CLASSIFIER_INPUT_WIDTH/2.0f);
     float deg = err * (HFOV / EI_CLASSIFIER_INPUT_WIDTH);
-    int ang = constrain(int(SERVO_HOME_ANGLE + deg), 0, 180);
-    currentAngle = ang;
-    panServo.write(ang);
+    int ang = constrain(int(90 + deg), 0, 180);
 
+    Serial.println(String(pct) + "," + String(ang));
     // flash LED
     digitalWrite(FLASH_GPIO_NUM, HIGH);
     delay(50);
